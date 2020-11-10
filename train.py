@@ -3,17 +3,20 @@ import time
 import argparse
 import matplotlib.pyplot as plt
 import copy
+
+import petname
 import torch
 import numpy as np
 import torch.nn as nn
 import torch.optim as opt
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 from itertools import chain
 from torch.autograd import Variable
 from utils.parse_utils import Scale
 from torch.utils.data import DataLoader
 from utils.linear_models import predict_cv
-
+from saving_loading import TrainingState
 
 # Parser arguments
 parser = argparse.ArgumentParser(description='Social Ways trajectory prediction.')
@@ -24,8 +27,7 @@ parser.add_argument('--epochs', '--e',
                     type=int, default=1000, metavar='N',
                     help='number of epochs to train (default: 1000)')
 parser.add_argument('--model', '--m',
-                    default='socialWays',
-                    choices=['socialWays'],
+                    default=None,
                     help='pick a specific network to train'
                          '(default: "socialWays")')
 parser.add_argument('--latent-dim', '--ld',
@@ -41,7 +43,7 @@ parser.add_argument('--unrolling-steps', '--unroll',
                     type=int, default=1, metavar='N',
                     help='number of steps to unroll gan (default: 1)')
 parser.add_argument('--hidden-size', '--h-size',
-                    type=int, default=64, metavar='N',
+                    type=int, default=128, metavar='N',  # It was 64 initially
                     help='size of network intermediate layer (default: 64)')
 parser.add_argument('--dataset', '--data',
                     default='hotel',
@@ -49,12 +51,16 @@ parser.add_argument('--dataset', '--data',
                     help='pick a specific dataset (default: "hotel")')
 args = parser.parse_args()
 
+writer = SummaryWriter()
+global_step = 0
 
 # ========== set input/output files ============
 dataset_name = args.dataset
 model_name = args.model
-input_file = '../hotel-8-12.npz'
-model_file = '../trained_models/' + model_name + '-' + dataset_name + '.pt'
+if model_name is None:
+    model_name = petname.generate()
+input_file = 'hotel-8-12.npz'
+model_file = 'trained_models/' + model_name + '-' + dataset_name + '.pt'
 
 # FIXME: ====== training hyper-parameters ======
 # Unrolled GAN
@@ -80,7 +86,7 @@ num_social_features = 3
 social_feature_size = args.hidden_size
 noise_len = args.hidden_size // 2
 n_lstm_layers = 1
-use_social = False
+use_social = True  # False
 # ==============================================
 
 # FIXME: ======= Loda Data =====================
@@ -120,8 +126,8 @@ dataset_obsv = scale.normalize(dataset_obsv)
 dataset_pred = scale.normalize(dataset_pred)
 ss = scale.sx
 # Copy normalized observations/paths to predict into torch GPU tensors
-dataset_obsv = torch.FloatTensor(dataset_obsv).cuda()
-dataset_pred = torch.FloatTensor(dataset_pred).cuda()
+dataset_obsv = torch.FloatTensor(dataset_obsv)  # .cuda()
+dataset_pred = torch.FloatTensor(dataset_pred)  # .cuda()
 
 
 # ================================================
@@ -166,8 +172,8 @@ class AttentionPooling(nn.Module):
 
             for ii in range(sb[0], sb[1]):
                 fi = f[ii, sb[0]:sb[1]]
-                sigma_i = torch.bmm(fi.unsqueeze(1), Wh[sb[0]:sb[1]]. unsqueeze(2))
-                sigma_i[ii-sb[0]] = -1000
+                sigma_i = torch.bmm(fi.unsqueeze(1), Wh[sb[0]:sb[1]].unsqueeze(2))
+                sigma_i[ii - sb[0]] = -1000
 
                 attentions = torch.softmax(sigma_i.squeeze(), dim=0)
                 S[ii] = torch.mm(attentions.view(1, N), h[sb[0]:sb[1]])
@@ -208,8 +214,8 @@ def Bearing(xA_4d, xB_4d):
 def DCA_MTX(x_4d, D_4d):
     Dp = D_4d[:, :, :2]
     Dv = D_4d[:, :, 2:]
-    DOT_Dp_Dv = torch.mul(Dp[:,:,0], Dv[:,:,0]) + torch.mul(Dp[:,:,1], Dv[:,:,1])
-    Dv_sq = torch.mul(Dv[:,:,0], Dv[:,:,0]) + torch.mul(Dv[:,:,1], Dv[:,:,1]) + 1E-6
+    DOT_Dp_Dv = torch.mul(Dp[:, :, 0], Dv[:, :, 0]) + torch.mul(Dp[:, :, 1], Dv[:, :, 1])
+    Dv_sq = torch.mul(Dv[:, :, 0], Dv[:, :, 0]) + torch.mul(Dv[:, :, 1], Dv[:, :, 1]) + 1E-6
     TTCA = -torch.div(DOT_Dp_Dv, Dv_sq)
     DCA = torch.zeros_like(Dp)
     DCA[:, :, 0] = Dp[:, :, 0] + TTCA * Dv[:, :, 0]
@@ -238,7 +244,7 @@ def SocialFeatures(x, sub_batches):
     dcas_MTX = DCA_MTX(x[:, -1], Dx_mat)
     sFeatures_MTX = torch.stack([l2_dist_MTX, bearings_MTX, dcas_MTX], dim=2)
 
-    return sFeatures_MTX   # directly return the Social Features Matrix
+    return sFeatures_MTX  # directly return the Social Features Matrix
 
 
 # LSTM path encoding module
@@ -273,6 +279,7 @@ class Discriminator(nn.Module):
     def __init__(self, n_next, hidden_dim, n_latent_code):
         super(Discriminator, self).__init__()
         self.lstm_dim = hidden_dim
+        """n_next = dataset_pred.shape[1]"""
         self.n_next = n_next
         # LSTM Encoder for the observed part
         self.obsv_encoder_lstm = nn.LSTM(4, hidden_dim, batch_first=True)
@@ -282,28 +289,44 @@ class Discriminator(nn.Module):
                                              nn.Linear(hidden_dim // 2, hidden_dim // 2))
         # FC Encoder for the predicted part: input is n_next*4 (whole predicted trajectory), output is
         # hidden_dim//2. This ouput will also be part of the input of the classifier.
-        self.pred_encoder = nn.Sequential(nn.Linear(n_next * 4, hidden_dim // 2), nn.LeakyReLU(0.2),
+        """My addition"""
+        self.pred_encoder_lstm = nn.LSTM(4, hidden_dim, batch_first=True)
+        self.pred_encoder = nn.Sequential(nn.Linear(hidden_dim, hidden_dim // 2), nn.LeakyReLU(0.2),
                                           nn.Linear(hidden_dim // 2, hidden_dim // 2))
+        """Previously only had this"""
+        # self.pred_encoder = nn.Sequential(nn.Linear(n_next * 4, hidden_dim // 2), nn.LeakyReLU(0.2),
+        #                                   nn.Linear(hidden_dim // 2, hidden_dim // 2))
         # Classifier: input is hidden_dim (concatenated encodings of observed and predicted trajectories), output is 1
         self.classifier = nn.Sequential(nn.Linear(hidden_dim, hidden_dim // 2), nn.LeakyReLU(0.2),
                                         nn.Linear(hidden_dim // 2, 1))
-        # Latent code inference: input is hidden_dim (concatenated encodings of observed and predicted trajectories), output is n_latent_code (distribution of latent codes)
+        # Latent code inference: input is hidden_dim (concatenated encodings of observed and predicted trajectories),
+        # output is n_latent_code (distribution of latent codes)
         self.latent_decoder = nn.Sequential(nn.Linear(hidden_dim, hidden_dim // 2), nn.LeakyReLU(0.2),
                                             nn.Linear(self.lstm_dim // 2, n_latent_code))
 
     def forward(self, obsv, pred):
         bs = obsv.size(0)
-        lstm_h_c = (torch.zeros(1, bs, self.lstm_dim).cuda(),
-                    torch.zeros(1, bs, self.lstm_dim).cuda())
+        # lstm_h_c = (torch.zeros(1, bs, self.lstm_dim).cuda(),
+        #             torch.zeros(1, bs, self.lstm_dim).cuda())
+        lstm_h_c = (torch.zeros(1, bs, self.lstm_dim),
+                    torch.zeros(1, bs, self.lstm_dim))
         # Encoding of the observed sequence trhough an LSTM cell
         obsv_code, lstm_h_c = self.obsv_encoder_lstm(obsv, lstm_h_c)
         # Further encoding through a FC layer
         obsv_code = self.obsv_encoder_fc(obsv_code[:, -1])
+        """My addition"""
+        lstm_h_c_p = (torch.zeros(1, bs, self.lstm_dim),
+                    torch.zeros(1, bs, self.lstm_dim))
+        pred_code, lstm_h_c_p = self.pred_encoder_lstm(pred, lstm_h_c_p)
+        # Further encoding through a FC layer
+        pred_code = self.pred_encoder(pred_code[:, -1])
         # Encoding of the predicted/next part of the sequence through a FC layer
-        pred_code = self.pred_encoder(pred.view(-1, self.n_next * 4))
+        # pred_code = self.pred_encoder(pred.view(-1, self.n_next * 4))
         both_codes = torch.cat([obsv_code, pred_code], dim=1)
         # Applies classifier to the concatenation of the encodings of both parts
         label = self.classifier(both_codes)
+        """My addition"""
+        label = nn.functional.sigmoid(label)
         # Inference on the latent code
         code_hat = self.latent_decoder(both_codes)
         return label, code_hat
@@ -349,6 +372,7 @@ class DecoderLstm(nn.Module):
 
         # init_weights(self)
         self.lstm_h = []
+        self.hidden_size = hidden_size
 
     def init_lstm(self, h, c):
         # Initialization of the LSTM: hidden state and cell state
@@ -359,6 +383,10 @@ class DecoderLstm(nn.Module):
         bs = z.shape[0]
         # For each sample in the batch, concatenate h (hidden state), s (social term) and z (noise)
         inp = torch.cat([h, s, z], dim=1)
+        """My addition"""
+        h = torch.zeros(1, bs, self.hidden_size)
+        c = torch.zeros(1, bs, self.hidden_size)
+        self.init_lstm(h, c)
         # Applies a forward step.
         out, self.lstm_h = self.lstm(inp.unsqueeze(1), self.lstm_h)
         # Applies the fully connected layer to the LSTM output
@@ -366,14 +394,76 @@ class DecoderLstm(nn.Module):
         return out
 
 
+# class MyGeneratorModel(nn.Module):
+#     def __init__(self, hidden_size, n_lstm_layers, num_social_features, social_feature_size, noise_len):
+#         super(MyGeneratorModel, self).__init__()
+#         self.hidden_size = hidden_size
+#         self.n_lstm_layers = n_lstm_layers
+#         self.num_social_features = num_social_features
+#         self.social_feature_size = social_feature_size
+#         self.noise_len = noise_len
+#
+#         encoder = EncoderLstm(hidden_size, n_lstm_layers)  # .cuda()
+#         feature_embedder = EmbedSocialFeatures(num_social_features, social_feature_size)  # .cuda()
+#         attention = AttentionPooling(hidden_size, social_feature_size)  # .cuda()
+#
+#         # Decoder
+#         decoder = DecoderFC(hidden_size + social_feature_size + noise_len)  # .cuda()
+#
+#     def forward(self, obsv_p, noise, n_next, sub_batches=[]):
+#         # Batch size
+#         bs = obsv_p.shape[0]
+#         # Adds the velocity component to the observations.
+#         # This makes of obsv_4d a batch_sizexTx4 tensor
+#         obsv_4d = get_traj_4d(obsv_p, [])
+#         # Initial values for the hidden and cell states (zero)
+#         # lstm_h_c = (torch.zeros(n_lstm_layers, bs, encoder.hidden_size).cuda(),
+#         #             torch.zeros(n_lstm_layers, bs, encoder.hidden_size).cuda())
+#         lstm_h_c = (torch.zeros(self.n_lstm_layers, bs, self.encoder.hidden_size),
+#                     torch.zeros(self.n_lstm_layers, bs, self.encoder.hidden_size))
+#         self.encoder.init_lstm(lstm_h_c[0], lstm_h_c[1])
+#         # Apply the encoder to the observed sequence
+#         # obsv_4d: batch_sizexTx4 tensor
+#         self.encoder(obsv_4d)
+#         if len(sub_batches) == 0:
+#             sub_batches = [[0, obsv_p.size(0)]]
+#
+#         if use_social:
+#             features = SocialFeatures(obsv_4d, sub_batches)
+#             emb_features = self.feature_embedder(features, sub_batches)
+#             weighted_features = self.attention(emb_features, self.encoder.lstm_h[0].squeeze(), sub_batches)
+#         else:
+#             weighted_features = torch.zeros_like(self.encoder.lstm_h[0].squeeze())
+#
+#         pred_4ds = []
+#         last_obsv = obsv_4d[:, -1]
+#         # For all the steps to predict, applies a step of the decoder
+#         for ii in range(n_next):
+#             # Takes the current output of the encoder to feed the decoder
+#             # Gets the ouputs as a displacement/velocity
+#             new_v = self.decoder(self.encoder.lstm_h[0].view(bs, -1), weighted_features.view(bs, -1), noise).view(bs, 2)
+#             # Deduces the predicted position
+#             new_p = new_v + last_obsv[:, :2]
+#             # The last prediction done will be new_p,new_v
+#             last_obsv = torch.cat([new_p, new_v], dim=1)
+#             # Keeps all the predictions
+#             pred_4ds.append(last_obsv)
+#             # Applies LSTM encoding to the last prediction
+#             # pred_4ds[-1]: batch_sizex4 tensor
+#             encoder(pred_4ds[-1])
+#
+#         return torch.stack(pred_4ds, 1)
+
+
 # LSTM-based path encoder
-encoder = EncoderLstm(hidden_size, n_lstm_layers).cuda()
-feature_embedder = EmbedSocialFeatures(num_social_features, social_feature_size).cuda()
-attention = AttentionPooling(hidden_size, social_feature_size).cuda()
+encoder = EncoderLstm(hidden_size, n_lstm_layers)  # .cuda() # Trainable params : 33600
+feature_embedder = EmbedSocialFeatures(num_social_features, social_feature_size)  # .cuda() # Trainable params : 6400
+attention = AttentionPooling(hidden_size, social_feature_size)  # .cuda() # Trainable params : 4160
 
 # Decoder
-decoder = DecoderFC(hidden_size + social_feature_size + noise_len).cuda()
-# decoder = DecoderLstm(social_feature_size + VEL_VEC_LEN + noise_len, traj_code_len).cuda()
+# decoder = DecoderFC(hidden_size + social_feature_size + noise_len)  # .cuda()  # Trainable params : 41962
+# decoder = DecoderLstm(social_feature_size + VEL_VEC_LEN + noise_len, traj_code_len)#.cuda()
+decoder = DecoderLstm(social_feature_size + hidden_size + noise_len, hidden_size)#.cuda()
 
 # The Generator parameters and their optimizer
 predictor_params = chain(attention.parameters(), feature_embedder.parameters(),
@@ -381,8 +471,13 @@ predictor_params = chain(attention.parameters(), feature_embedder.parameters(),
 predictor_optimizer = opt.Adam(predictor_params, lr=lr_g, betas=(0.9, 0.999))
 
 # The Discriminator parameters and their optimizer
-D = Discriminator(n_next, hidden_size, n_latent_codes).cuda()
+D = Discriminator(n_next, hidden_size, n_latent_codes)  # .cuda() # Trainable params : 27939
 D_optimizer = opt.Adam(D.parameters(), lr=lr_d, betas=(0.9, 0.999))
+stateD = TrainingState(model=D, optimizer=D_optimizer, lr_scheduler=None, file_glob=None)
+writerD = stateD.writer
+
+# total param number 114061
+
 mse_loss = nn.MSELoss()
 bce_loss = nn.BCELoss()
 
@@ -396,8 +491,10 @@ def predict(obsv_p, noise, n_next, sub_batches=[]):
     # This makes of obsv_4d a batch_sizexTx4 tensor
     obsv_4d = get_traj_4d(obsv_p, [])
     # Initial values for the hidden and cell states (zero)
-    lstm_h_c = (torch.zeros(n_lstm_layers, bs, encoder.hidden_size).cuda(),
-                torch.zeros(n_lstm_layers, bs, encoder.hidden_size).cuda())
+    # lstm_h_c = (torch.zeros(n_lstm_layers, bs, encoder.hidden_size).cuda(),
+    #             torch.zeros(n_lstm_layers, bs, encoder.hidden_size).cuda())
+    lstm_h_c = (torch.zeros(n_lstm_layers, bs, encoder.hidden_size),
+                torch.zeros(n_lstm_layers, bs, encoder.hidden_size))
     encoder.init_lstm(lstm_h_c[0], lstm_h_c[1])
     # Apply the encoder to the observed sequence
     # obsv_4d: batch_sizexTx4 tensor
@@ -437,6 +534,7 @@ def predict(obsv_p, noise, n_next, sub_batches=[]):
 
 # =============== Training Loop ==================
 def train():
+    global writer, global_step
     tic = time.clock()
     # Evaluation metrics (ADE/FDE)
     train_ADE, train_FDE = 0, 0
@@ -461,19 +559,22 @@ def train():
             sub_batches = sub_batches - sub_batches[0][0]
             # May have to fill with 0
             filling_len = batch_size - int(batch_size_accum)
-            #obsv = torch.cat((obsv, torch.zeros(filling_len, n_past, 2).cuda()), dim=0)
-            #pred = torch.cat((pred, torch.zeros(filling_len, n_next, 2).cuda()), dim=0)
+            # obsv = torch.cat((obsv, torch.zeros(filling_len, n_past, 2).cuda()), dim=0)
+            # pred = torch.cat((pred, torch.zeros(filling_len, n_next, 2).cuda()), dim=0)
 
             bs = batch_size_accum
 
             # Completes the positional vectors with velocities (to have dimension 4)
             obsv_4d, pred_4d = get_traj_4d(obsv, pred)
-            zeros = Variable(torch.zeros(bs, 1) + np.random.uniform(0, 0.1), requires_grad=False).cuda()
-            ones = Variable(torch.ones(bs, 1) * np.random.uniform(0.9, 1.0), requires_grad=False).cuda()
-            noise = torch.FloatTensor(torch.rand(bs, noise_len)).cuda()
+            zeros = Variable(torch.zeros(bs, 1) + np.random.uniform(0, 0.1), requires_grad=False)  # .cuda()
+            ones = Variable(torch.ones(bs, 1) * np.random.uniform(0.9, 1.0), requires_grad=False)  # .cuda()
+            noise = torch.FloatTensor(torch.rand(bs, noise_len))  # .cuda()
 
             # ============== Train Discriminator ================
             for u in range(n_unrolling_steps + 1):
+                ### Tighest loop
+                global_step += 1
+
                 # Zero the gradient buffers of all parameters
                 D.zero_grad()
                 with torch.no_grad():
@@ -481,11 +582,11 @@ def train():
 
                 fake_labels, code_hat = D(obsv_4d, pred_hat_4d)  # classify fake samples
                 # Evaluate the MSE loss: the fake_labels should be close to zero
-                d_loss_fake = mse_loss(fake_labels, zeros)
+                d_loss_fake = bce_loss(fake_labels, zeros)
                 d_loss_info = mse_loss(code_hat.squeeze(), noise[:, :n_latent_codes])
                 # Evaluate the MSE loss: the real should be close to one
                 real_labels, code_hat = D(obsv_4d, pred_4d)  # classify real samples
-                d_loss_real = mse_loss(real_labels, ones)
+                d_loss_real = bce_loss(real_labels, ones)
 
                 #  FIXME: which loss functinos to use for D?
                 d_loss = d_loss_fake + d_loss_real
@@ -497,6 +598,11 @@ def train():
 
                 if u == 0 and n_unrolling_steps > 0:
                     backup = copy.deepcopy(D)
+
+                writer.add_scalar(f'Training/d_loss_fake', d_loss_fake, global_step)
+                writer.add_scalar(f'Training/d_loss_info', d_loss_info, global_step)
+                writer.add_scalar(f'Training/d_loss_real', d_loss_real, global_step)
+
 
             # =============== Train Generator ================= #
             # Zero the gradient buffers of all the discriminator parameters
@@ -511,7 +617,7 @@ def train():
             # L2 loss between the predicted paths and the true ones
             g_loss_l2 = mse_loss(pred_hat_4d[:, :, :2], pred)
             # Adversarial loss (classification labels should be close to one)
-            g_loss_fooling = mse_loss(gen_labels, ones)
+            g_loss_fooling = bce_loss(gen_labels, ones)
             # Information loss
             g_loss_info = mse_loss(code_hat.squeeze(), noise[:, :n_latent_codes])
 
@@ -524,16 +630,17 @@ def train():
             # If using the L2 loss
             if use_l2_loss:
                 g_loss += loss_l2_w * g_loss_l2
-            if use_variety_loss:
+            if True:
                 KV = 20
                 all_20_losses = []
                 for k in range(KV):
-                    pred_hat_4d = predict(obsv, noise, n_next, sub_batches)
-                    loss_l2_k = mse_loss(pred_hat_4d[k, :, :2], pred[k])
+                    pred_hat_4d_variety = predict(obsv, noise, n_next, sub_batches)
+                    loss_l2_k = mse_loss(pred_hat_4d_variety[k, :, :2], pred[k])
                 all_20_losses.append(loss_l2_k.unsqueeze(0))
                 all_20_losses = torch.cat(all_20_losses)
                 variety_loss, _ = torch.min(all_20_losses, dim=0)
-                g_loss += loss_l2_w * variety_loss
+                if use_variety_loss:
+                    g_loss += loss_l2_w * variety_loss
 
             g_loss.backward()
             predictor_optimizer.step()
@@ -547,11 +654,20 @@ def train():
                 err_all = torch.pow((pred_hat_4d[:, :, :2] - pred) / ss, 2)
                 err_all = err_all.sum(dim=2).sqrt()
                 e = err_all.sum().item() / n_next
+                f = err_all[:, -1].sum().item()
                 train_ADE += e
-                train_FDE += err_all[:, -1].sum().item()
+                train_FDE += f
 
-            batch_size_accum = 0;
+            batch_size_accum = 0
             sub_batches = []
+
+            writer.add_scalar(f'Training/g_loss_l2', g_loss_l2, global_step)
+            writer.add_scalar(f'Training/g_loss_fooling', g_loss_fooling, global_step)
+            writer.add_scalar(f'Training/g_loss_info', g_loss_info, global_step)
+            writer.add_scalar(f'Training/variety_loss', variety_loss, global_step)
+
+            writer.add_scalar(f'Training/ADE', e, global_step)
+            writer.add_scalar(f'Training/FDE', f, global_step)
 
     train_ADE /= n_train_samples
     train_FDE /= n_train_samples
@@ -565,7 +681,7 @@ def test(n_gen_samples=20, linear=False, write_to_file=None, just_one=False):
     plt.close()
     ade_avg_12, fde_avg_12 = 0, 0
     ade_min_12, fde_min_12 = 0, 0
-    for ii, batch_i in enumerate(test_batches):        
+    for ii, batch_i in enumerate(test_batches):
         obsv = dataset_obsv[batch_i[0]:batch_i[1]]
         pred = dataset_pred[batch_i[0]:batch_i[1]]
         current_t = dataset_t[batch_i[0]]
@@ -581,7 +697,7 @@ def test(n_gen_samples=20, linear=False, write_to_file=None, just_one=False):
                 all_20_errors.append(err_all.unsqueeze(0))
             else:
                 for kk in range(n_gen_samples):
-                    noise = torch.FloatTensor(torch.rand(bs, noise_len)).cuda()
+                    noise = torch.FloatTensor(torch.rand(bs, noise_len))  # .cuda()
                     pred_hat_4d = predict(obsv, noise, n_next)
                     all_20_preds.append(pred_hat_4d.unsqueeze(0))
                     err_all = torch.pow((pred_hat_4d[:, :, :2] - pred) / ss, 2).sum(dim=2, keepdim=True).sqrt()
@@ -663,6 +779,6 @@ for epoch in trange(start_epoch, n_epochs + 1):  # FIXME : set the number of epo
         }, model_file)
 
     if epoch % 5 == 0:
-        wr_dir = '../medium/' + dataset_name + '/' + model_name + '/' + str(epoch)
+        wr_dir = 'medium/' + dataset_name + '/' + model_name + '/' + str(epoch)
         os.makedirs(wr_dir, exist_ok=True)
         test(128, write_to_file=wr_dir, just_one=True)

@@ -241,9 +241,9 @@ class BIWIParser:
         self.interval = -1
 
     def load(self, filename, down_sample=1):
-        pos_data_dict = dict()
-        vel_data_dict = dict()
-        time_data_dict = dict()
+        pos_data_dict = dict() # This is a dictionary with key as ped_ID and value as an array of (x,y)
+        vel_data_dict = dict()  # This is a dictionary with key as ped_ID and value as an array of (vx,vy)
+        time_data_dict = dict() # This is a dictionary with key as ped_ID and value as an array of times that pedestrian was observed
         self.all_ids.clear()
 
         if 'zara' in filename:
@@ -271,18 +271,18 @@ class BIWIParser:
                     while '' in row: row.remove('')
                     if len(row) < 8: continue
 
-                    ts = float(row[0])
-                    id = round(float(row[1]))
+                    ts = float(row[0])  # time
+                    id = round(float(row[1]))  # ID
                     if ts % down_sample != 0:
                         continue
                     if ts < self.min_t: self.min_t = ts
                     if ts > self.max_t: self.max_t = ts
 
 
-                    px = float(row[2])
-                    py = float(row[4])
-                    vx = float(row[5])
-                    vy = float(row[7])
+                    px = float(row[2])  # position x
+                    py = float(row[4])  # position y
+                    vx = float(row[5])  # velocity x
+                    vy = float(row[7])  # velocity y
 
                     if id not in id_list:
                         id_list.append(id)
@@ -294,14 +294,15 @@ class BIWIParser:
                     vel_data_dict[id].append(np.array([vx, vy]))
                     time_data_dict[id] = np.hstack((time_data_dict[id], np.array([ts])))
             self.all_ids += id_list
-
-        for ped_id, ped_T in time_data_dict.items():
+        # 18061.0 was the max_t (18s?)
+        for ped_id, ped_T in time_data_dict.items(): # this function just finds the interval between the first 2 occurances of each pedestraina and set it as the self.interval
             if len(ped_T) > 1:
                 interval = int(round(ped_T[1] - ped_T[0]))
                 if interval > 0:
                     self.interval = interval
                     break
 
+        """This function populates posiion data, velocity data, time data; as arrays. Not as dictionaries"""
         for key, value in pos_data_dict.items():
             poss_i = np.array(value)
             self.p_data.append(poss_i)
