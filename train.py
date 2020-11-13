@@ -1,60 +1,64 @@
 import os
 import time
 import argparse
+import git
 import matplotlib.pyplot as plt
 import copy
 import torch
 import numpy as np
 import torch.nn as nn
 import torch.optim as opt
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 from itertools import chain
 from torch.autograd import Variable
 from utils.parse_utils import Scale
 from torch.utils.data import DataLoader
 from utils.linear_models import predict_cv
-
+import petname
 
 # Parser arguments
 parser = argparse.ArgumentParser(description='Social Ways trajectory prediction.')
 parser.add_argument('--batch-size', '--b',
-                    type=int, default=256, metavar='N',
+                    type=int, default=64, metavar='N',
                     help='input batch size for training (default: 256)')
 parser.add_argument('--epochs', '--e',
-                    type=int, default=1000, metavar='N',
+                    type=int, default=20000, metavar='N',
                     help='number of epochs to train (default: 1000)')
 parser.add_argument('--model', '--m',
-                    default='socialWays',
-                    choices=['socialWays'],
+                    default=None,
                     help='pick a specific network to train'
                          '(default: "socialWays")')
-parser.add_argument('--latent-dim', '--ld',
-                    type=int, default=10, metavar='N',
-                    help='dimension of latent space (default: 10)')
 parser.add_argument('--d-learning-rate', '--d-lr',
-                    type=float, default=1E-3, metavar='N',
+                    type=float, default=1E-4, metavar='N',
                     help='learning rate of discriminator (default: 1E-3)')
 parser.add_argument('--g-learning-rate', '--g-lr',
-                    type=float, default=1E-4, metavar='N',
+                    type=float, default=1E-3, metavar='N',
                     help='learning rate of generator (default: 1E-4)')
 parser.add_argument('--unrolling-steps', '--unroll',
                     type=int, default=1, metavar='N',
                     help='number of steps to unroll gan (default: 1)')
 parser.add_argument('--hidden-size', '--h-size',
-                    type=int, default=64, metavar='N',
+                    type=int, default=128, metavar='N',
                     help='size of network intermediate layer (default: 64)')
 parser.add_argument('--dataset', '--data',
                     default='hotel',
                     choices=['hotel'],
                     help='pick a specific dataset (default: "hotel")')
+parser.add_argument('--ifTrain', '--ifTrain',
+                    default=True,
+                    help='training or testing')
 args = parser.parse_args()
-
 
 # ========== set input/output files ============
 dataset_name = args.dataset
 model_name = args.model
-input_file = '../hotel-8-12.npz'
-model_file = '../trained_models/' + model_name + '-' + dataset_name + '.pt'
+if model_name is None:
+    model_name = petname.generate()
+    git.Repo().create_tag(f'model/{model_name}')
+writer = SummaryWriter(log_dir=f'runs/{model_name}')
+input_file = 'hotel-8-12.npz'
+model_file = 'trained_models/' + model_name + '-' + dataset_name + '.pt'
 
 # FIXME: ====== training hyper-parameters ======
 # Unrolled GAN
@@ -70,17 +74,18 @@ loss_l2_w = 0.5  # WARNING for both l2 and variety
 # Learning Rate
 lr_g = args.g_learning_rate
 lr_d = args.d_learning_rate
+global_step = 0
 # FIXME: ====== Network Size ===================
 # Batch size
 batch_size = args.batch_size
 # LSTM hidden size
-hidden_size = args.hidden_size
+hidden_size = args.hidden_size  # 128
 n_epochs = args.epochs
 num_social_features = 3
-social_feature_size = args.hidden_size
-noise_len = args.hidden_size // 2
+social_feature_size = args.hidden_size  # 128
+noise_len = args.hidden_size // 2  # 64
 n_lstm_layers = 1
-use_social = False
+use_social = True
 # ==============================================
 
 # FIXME: ======= Loda Data =====================
@@ -150,45 +155,6 @@ def calc_error(pred_hat, pred):
     return ADEs.data.cpu().numpy(), FDEs.data().cpu().numpy()
 
 
-class AttentionPooling(nn.Module):
-    def __init__(self, h_dim, f_dim):
-        super(AttentionPooling, self).__init__()
-        self.f_dim = f_dim
-        self.h_dim = h_dim
-        self.W = nn.Linear(h_dim, f_dim, bias=True)
-
-    def forward(self, f, h, sub_batches):
-        Wh = self.W(h)
-        S = torch.zeros_like(h)
-        for sb in sub_batches:
-            N = sb[1] - sb[0]
-            if N == 1: continue
-
-            for ii in range(sb[0], sb[1]):
-                fi = f[ii, sb[0]:sb[1]]
-                sigma_i = torch.bmm(fi.unsqueeze(1), Wh[sb[0]:sb[1]]. unsqueeze(2))
-                sigma_i[ii-sb[0]] = -1000
-
-                attentions = torch.softmax(sigma_i.squeeze(), dim=0)
-                S[ii] = torch.mm(attentions.view(1, N), h[sb[0]:sb[1]])
-
-        return S
-
-
-class EmbedSocialFeatures(nn.Module):
-    def __init__(self, input_size, hidden_size):
-        super(EmbedSocialFeatures, self).__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.fc = nn.Sequential(nn.Linear(input_size, 32), nn.ReLU(),
-                                nn.Linear(32, 64), nn.ReLU(),
-                                nn.Linear(64, hidden_size))
-
-    def forward(self, ftr_list, sub_batches):
-        embedded_features = self.fc(ftr_list)
-        return embedded_features
-
-
 def DCA(xA_4d, xB_4d):
     dp = xA_4d[:2] - xB_4d[:2]
     dv = xA_4d[2:] - xB_4d[2:]
@@ -208,8 +174,8 @@ def Bearing(xA_4d, xB_4d):
 def DCA_MTX(x_4d, D_4d):
     Dp = D_4d[:, :, :2]
     Dv = D_4d[:, :, 2:]
-    DOT_Dp_Dv = torch.mul(Dp[:,:,0], Dv[:,:,0]) + torch.mul(Dp[:,:,1], Dv[:,:,1])
-    Dv_sq = torch.mul(Dv[:,:,0], Dv[:,:,0]) + torch.mul(Dv[:,:,1], Dv[:,:,1]) + 1E-6
+    DOT_Dp_Dv = torch.mul(Dp[:, :, 0], Dv[:, :, 0]) + torch.mul(Dp[:, :, 1], Dv[:, :, 1])
+    Dv_sq = torch.mul(Dv[:, :, 0], Dv[:, :, 0]) + torch.mul(Dv[:, :, 1], Dv[:, :, 1]) + 1E-6
     TTCA = -torch.div(DOT_Dp_Dv, Dv_sq)
     DCA = torch.zeros_like(Dp)
     DCA[:, :, 0] = Dp[:, :, 0] + TTCA * Dv[:, :, 0]
@@ -238,7 +204,46 @@ def SocialFeatures(x, sub_batches):
     dcas_MTX = DCA_MTX(x[:, -1], Dx_mat)
     sFeatures_MTX = torch.stack([l2_dist_MTX, bearings_MTX, dcas_MTX], dim=2)
 
-    return sFeatures_MTX   # directly return the Social Features Matrix
+    return sFeatures_MTX  # directly return the Social Features Matrix # shape([64, 64, 3])
+
+
+class AttentionPooling(nn.Module):
+    def __init__(self, h_dim, f_dim):
+        super(AttentionPooling, self).__init__()
+        self.f_dim = f_dim  # 128
+        self.h_dim = h_dim  # 128
+        self.W = nn.Linear(h_dim, f_dim, bias=True)
+
+    def forward(self, f, h, sub_batches):
+        Wh = self.W(h)
+        S = torch.zeros_like(h)
+        for sb in sub_batches:
+            N = sb[1] - sb[0]
+            if N == 1: continue
+
+            for ii in range(sb[0], sb[1]):
+                fi = f[ii, sb[0]:sb[1]]
+                sigma_i = torch.bmm(fi.unsqueeze(1), Wh[sb[0]:sb[1]].unsqueeze(2))
+                sigma_i[ii - sb[0]] = -1000  # ignoring oneself
+
+                attentions = torch.softmax(sigma_i.squeeze(), dim=0)
+                S[ii] = torch.mm(attentions.view(1, N), h[sb[0]:sb[1]])
+
+        return S
+
+
+class EmbedSocialFeatures(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(EmbedSocialFeatures, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.fc = nn.Sequential(nn.Linear(input_size, 32), nn.ReLU(),
+                                nn.Linear(32, 64), nn.ReLU(),
+                                nn.Linear(64, hidden_size))
+
+    def forward(self, ftr_list, sub_batches):
+        embedded_features = self.fc(ftr_list)
+        return embedded_features
 
 
 # LSTM path encoding module
@@ -269,61 +274,14 @@ class EncoderLstm(nn.Module):
         return y
 
 
-class Discriminator(nn.Module):
-    def __init__(self, n_next, hidden_dim, n_latent_code):
-        super(Discriminator, self).__init__()
-        self.lstm_dim = hidden_dim
-        self.n_next = n_next
-        # LSTM Encoder for the observed part
-        self.obsv_encoder_lstm = nn.LSTM(4, hidden_dim, batch_first=True)
-        # FC sub-network: input is hidden_dim, output is hidden_dim//2. This ouput will be part of
-        # the input of the classifier.
-        self.obsv_encoder_fc = nn.Sequential(nn.Linear(hidden_dim, hidden_dim // 2), nn.LeakyReLU(0.2),
-                                             nn.Linear(hidden_dim // 2, hidden_dim // 2))
-        # FC Encoder for the predicted part: input is n_next*4 (whole predicted trajectory), output is
-        # hidden_dim//2. This ouput will also be part of the input of the classifier.
-        self.pred_encoder = nn.Sequential(nn.Linear(n_next * 4, hidden_dim // 2), nn.LeakyReLU(0.2),
-                                          nn.Linear(hidden_dim // 2, hidden_dim // 2))
-        # Classifier: input is hidden_dim (concatenated encodings of observed and predicted trajectories), output is 1
-        self.classifier = nn.Sequential(nn.Linear(hidden_dim, hidden_dim // 2), nn.LeakyReLU(0.2),
-                                        nn.Linear(hidden_dim // 2, 1))
-        # Latent code inference: input is hidden_dim (concatenated encodings of observed and predicted trajectories), output is n_latent_code (distribution of latent codes)
-        self.latent_decoder = nn.Sequential(nn.Linear(hidden_dim, hidden_dim // 2), nn.LeakyReLU(0.2),
-                                            nn.Linear(self.lstm_dim // 2, n_latent_code))
-
-    def forward(self, obsv, pred):
-        bs = obsv.size(0)
-        lstm_h_c = (torch.zeros(1, bs, self.lstm_dim).cuda(),
-                    torch.zeros(1, bs, self.lstm_dim).cuda())
-        # Encoding of the observed sequence trhough an LSTM cell
-        obsv_code, lstm_h_c = self.obsv_encoder_lstm(obsv, lstm_h_c)
-        # Further encoding through a FC layer
-        obsv_code = self.obsv_encoder_fc(obsv_code[:, -1])
-        # Encoding of the predicted/next part of the sequence through a FC layer
-        pred_code = self.pred_encoder(pred.view(-1, self.n_next * 4))
-        both_codes = torch.cat([obsv_code, pred_code], dim=1)
-        # Applies classifier to the concatenation of the encodings of both parts
-        label = self.classifier(both_codes)
-        # Inference on the latent code
-        code_hat = self.latent_decoder(both_codes)
-        return label, code_hat
-
-    def load(self, backup):
-        for m_from, m_to in zip(backup.modules(), self.modules()):
-            if isinstance(m_to, nn.Linear):
-                m_to.weight.data = m_from.weight.data.clone()
-                if m_to.bias is not None:
-                    m_to.bias.data = m_from.bias.data.clone()
-
-
 # FC path decoding module
 class DecoderFC(nn.Module):
     def __init__(self, hidden_dim):
         super(DecoderFC, self).__init__()
         # Fully connected sub-network. Input is hidden_dim, output is 2.
-        self.fc1 = torch.nn.Sequential(torch.nn.Linear(hidden_dim, hidden_dim), nn.LeakyReLU(0.2),
-                                       # torch.nn.Linear(64, 64), nn.LeakyReLU(0.2),
-                                       torch.nn.Linear(hidden_dim, hidden_dim // 2), nn.LeakyReLU(0.2),
+        self.fc1 = torch.nn.Sequential(torch.nn.Linear(hidden_dim, hidden_dim), nn.LeakyReLU(0.1),
+                                       # torch.nn.Linear(64, 64), nn.LeakyReLU(0.1),
+                                       torch.nn.Linear(hidden_dim, hidden_dim // 2), nn.LeakyReLU(0.1),
                                        torch.nn.Linear(hidden_dim // 2, hidden_dim // 4),
                                        torch.nn.Linear(hidden_dim // 4, 2))
 
@@ -343,8 +301,8 @@ class DecoderLstm(nn.Module):
         self.lstm = torch.nn.LSTM(input_size, hidden_size, num_layers=1, batch_first=True)
         # Fully connected sub-network. Input is hidden_size, output is 2.
         self.fc = nn.Sequential(torch.nn.Linear(hidden_size, 64), nn.Sigmoid(),
-                                torch.nn.Linear(64, 64), nn.LeakyReLU(0.2),
-                                torch.nn.Linear(64, 32), nn.LeakyReLU(0.2),
+                                torch.nn.Linear(64, 64), nn.LeakyReLU(0.1),
+                                torch.nn.Linear(64, 32), nn.LeakyReLU(0.1),
                                 torch.nn.Linear(32, 2))
 
         # init_weights(self)
@@ -366,27 +324,64 @@ class DecoderLstm(nn.Module):
         return out
 
 
-# LSTM-based path encoder
-encoder = EncoderLstm(hidden_size, n_lstm_layers).cuda()
-feature_embedder = EmbedSocialFeatures(num_social_features, social_feature_size).cuda()
-attention = AttentionPooling(hidden_size, social_feature_size).cuda()
+class Discriminator(nn.Module):
+    def __init__(self, n_next, hidden_dim, n_latent_code):
+        super(Discriminator, self).__init__()
+        self.lstm_dim = hidden_dim
+        self.n_next = n_next
+        # LSTM Encoder for the observed part
+        self.obsv_encoder_lstm = nn.LSTM(4, hidden_dim, batch_first=True)
+        # FC sub-network: input is hidden_dim, output is hidden_dim//2. This ouput will be part of
+        # the input of the classifier.
+        self.obsv_encoder_fc = nn.Sequential(nn.Linear(hidden_dim, hidden_dim // 2), nn.LeakyReLU(0.1),
+                                             nn.Linear(hidden_dim // 2, hidden_dim // 2))
+        # FC Encoder for the predicted part: input is n_next*4 (whole predicted trajectory), output is
+        # hidden_dim//2. This ouput will also be part of the input of the classifier.
+        self.pred_encoder_lstm = nn.LSTM(4, hidden_dim, batch_first=True)
+        self.pred_encoder_fc = nn.Sequential(nn.Linear(hidden_dim, hidden_dim // 2), nn.LeakyReLU(0.1),
+                                             nn.Linear(hidden_dim // 2, hidden_dim // 2))
 
-# Decoder
-decoder = DecoderFC(hidden_size + social_feature_size + noise_len).cuda()
-# decoder = DecoderLstm(social_feature_size + VEL_VEC_LEN + noise_len, traj_code_len).cuda()
+        # self.pred_encoder = nn.Sequential(nn.Linear(n_next * 4, hidden_dim // 2), nn.LeakyReLU(0.1),
+        #                                   nn.Linear(hidden_dim // 2, hidden_dim // 2))
+        # Classifier: input is hidden_dim (concatenated encodings of observed and predicted trajectories), output is 1
+        self.classifier = nn.Sequential(nn.Linear(hidden_dim, hidden_dim // 2), nn.LeakyReLU(0.1),
+                                        nn.Linear(hidden_dim // 2, 1))
+        # Latent code inference: input is hidden_dim (concatenated encodings of observed and predicted trajectories),
+        # output is n_latent_code (distribution of latent codes)
+        self.latent_decoder = nn.Sequential(nn.Linear(hidden_dim, hidden_dim // 2), nn.LeakyReLU(0.1),
+                                            nn.Linear(self.lstm_dim // 2, n_latent_code))
 
-# The Generator parameters and their optimizer
-predictor_params = chain(attention.parameters(), feature_embedder.parameters(),
-                         encoder.parameters(), decoder.parameters())
-predictor_optimizer = opt.Adam(predictor_params, lr=lr_g, betas=(0.9, 0.999))
+    def forward(self, obsv, pred):
+        bs = obsv.size(0)
+        lstm_h_c = (torch.zeros(1, bs, self.lstm_dim).cuda()
+                    , torch.zeros(1, bs, self.lstm_dim).cuda()
+                    )
+        # Encoding of the observed sequence trhough an LSTM cell
+        obsv_code, lstm_h_c = self.obsv_encoder_lstm(obsv, lstm_h_c)
+        # Further encoding through a FC layer
+        obsv_code = self.obsv_encoder_fc(obsv_code[:, -1])
+        # Encoding of the predicted/next part of the sequence through a FC layer
+        lstm_h_c_p = (torch.zeros(1, bs, self.lstm_dim).cuda()
+                      , torch.zeros(1, bs, self.lstm_dim).cuda()
+                      )
+        # Encoding of the observed sequence trhough an LSTM cell
+        pred_code, lstm_h_c_p = self.pred_encoder_lstm(pred, lstm_h_c_p)
+        pred_code = self.pred_encoder_fc(pred_code[:, -1])
+        # pred_code = self.pred_encoder(pred.view(-1, self.n_next * 4))
+        both_codes = torch.cat([obsv_code, pred_code], dim=1)
+        # Applies classifier to the concatenation of the encodings of both parts
+        label = self.classifier(both_codes)
+        label = torch.nn.functional.sigmoid(label)
+        # Inference on the latent code
+        code_hat = self.latent_decoder(both_codes)
+        return label, code_hat
 
-# The Discriminator parameters and their optimizer
-D = Discriminator(n_next, hidden_size, n_latent_codes).cuda()
-D_optimizer = opt.Adam(D.parameters(), lr=lr_d, betas=(0.9, 0.999))
-mse_loss = nn.MSELoss()
-bce_loss = nn.BCELoss()
-
-print('hidden dim = %d | lr(G) =  %.5f | lr(D) =  %.5f' % (hidden_size, lr_g, lr_d))
+    def load(self, backup):
+        for m_from, m_to in zip(backup.modules(), self.modules()):
+            if isinstance(m_to, nn.Linear):
+                m_to.weight.data = m_from.weight.data.clone()
+                if m_to.bias is not None:
+                    m_to.bias.data = m_from.bias.data.clone()
 
 
 def predict(obsv_p, noise, n_next, sub_batches=[]):
@@ -396,8 +391,10 @@ def predict(obsv_p, noise, n_next, sub_batches=[]):
     # This makes of obsv_4d a batch_sizexTx4 tensor
     obsv_4d = get_traj_4d(obsv_p, [])
     # Initial values for the hidden and cell states (zero)
-    lstm_h_c = (torch.zeros(n_lstm_layers, bs, encoder.hidden_size).cuda(),
-                torch.zeros(n_lstm_layers, bs, encoder.hidden_size).cuda())
+    lstm_h_c = (torch.zeros(n_lstm_layers, bs, encoder.hidden_size).cuda()
+                , torch.zeros(n_lstm_layers, bs, encoder.hidden_size).cuda()
+                )
+
     encoder.init_lstm(lstm_h_c[0], lstm_h_c[1])
     # Apply the encoder to the observed sequence
     # obsv_4d: batch_sizexTx4 tensor
@@ -414,6 +411,11 @@ def predict(obsv_p, noise, n_next, sub_batches=[]):
 
     pred_4ds = []
     last_obsv = obsv_4d[:, -1]
+
+    lstm_h_d = torch.zeros(1, bs, hidden_size)
+    lstm_c_d = torch.zeros(1, bs, hidden_size)
+    decoder.init_lstm(lstm_h_d, lstm_c_d)
+
     # For all the steps to predict, applies a step of the decoder
     for ii in range(n_next):
         # Takes the current output of the encoder to feed the decoder
@@ -428,6 +430,7 @@ def predict(obsv_p, noise, n_next, sub_batches=[]):
         # Applies LSTM encoding to the last prediction
         # pred_4ds[-1]: batch_sizex4 tensor
         encoder(pred_4ds[-1])
+        # todo ??
 
     return torch.stack(pred_4ds, 1)
 
@@ -437,10 +440,11 @@ def predict(obsv_p, noise, n_next, sub_batches=[]):
 
 # =============== Training Loop ==================
 def train():
+    global writer, global_step
     tic = time.clock()
     # Evaluation metrics (ADE/FDE)
     train_ADE, train_FDE = 0, 0
-    batch_size_accum = 0;
+    batch_size_accum = 0
     sub_batches = []
     # For all the training batches
     for ii, batch_i in enumerate(train_batches):
@@ -452,8 +456,8 @@ def train():
         # batch_size_accum = sub_batches[-1][1]
         # ii = train_size-1
 
-        if ii >= train_size - 1 or \
-                batch_size_accum + (the_batches[ii + 1][1] - the_batches[ii + 1][0]) > batch_size:
+        if ii >= train_size - 1 or batch_size_accum + (the_batches[ii + 1][1] - the_batches[ii + 1][0]) > batch_size:
+
             # Observed partial paths
             obsv = dataset_obsv[sub_batches[0][0]:sub_batches[-1][1]]
             # Future partial paths
@@ -461,8 +465,8 @@ def train():
             sub_batches = sub_batches - sub_batches[0][0]
             # May have to fill with 0
             filling_len = batch_size - int(batch_size_accum)
-            #obsv = torch.cat((obsv, torch.zeros(filling_len, n_past, 2).cuda()), dim=0)
-            #pred = torch.cat((pred, torch.zeros(filling_len, n_next, 2).cuda()), dim=0)
+            # obsv = torch.cat((obsv, torch.zeros(filling_len, n_past, 2).cuda()), dim=0)
+            # pred = torch.cat((pred, torch.zeros(filling_len, n_next, 2).cuda()), dim=0)
 
             bs = batch_size_accum
 
@@ -474,6 +478,7 @@ def train():
 
             # ============== Train Discriminator ================
             for u in range(n_unrolling_steps + 1):
+                global_step += 1
                 # Zero the gradient buffers of all parameters
                 D.zero_grad()
                 with torch.no_grad():
@@ -481,11 +486,11 @@ def train():
 
                 fake_labels, code_hat = D(obsv_4d, pred_hat_4d)  # classify fake samples
                 # Evaluate the MSE loss: the fake_labels should be close to zero
-                d_loss_fake = mse_loss(fake_labels, zeros)
+                d_loss_fake = bce_loss(fake_labels, zeros)
                 d_loss_info = mse_loss(code_hat.squeeze(), noise[:, :n_latent_codes])
                 # Evaluate the MSE loss: the real should be close to one
                 real_labels, code_hat = D(obsv_4d, pred_4d)  # classify real samples
-                d_loss_real = mse_loss(real_labels, ones)
+                d_loss_real = bce_loss(real_labels, ones)
 
                 #  FIXME: which loss functinos to use for D?
                 d_loss = d_loss_fake + d_loss_real
@@ -497,6 +502,10 @@ def train():
 
                 if u == 0 and n_unrolling_steps > 0:
                     backup = copy.deepcopy(D)
+
+                writer.add_scalar('Training/d_loss_fake', d_loss_fake, global_step)
+                writer.add_scalar('Training/d_loss_real', d_loss_real, global_step)
+                writer.add_scalar('Training/d_loss_info', d_loss_info, global_step)
 
             # =============== Train Generator ================= #
             # Zero the gradient buffers of all the discriminator parameters
@@ -511,7 +520,7 @@ def train():
             # L2 loss between the predicted paths and the true ones
             g_loss_l2 = mse_loss(pred_hat_4d[:, :, :2], pred)
             # Adversarial loss (classification labels should be close to one)
-            g_loss_fooling = mse_loss(gen_labels, ones)
+            g_loss_fooling = bce_loss(gen_labels, ones)
             # Information loss
             g_loss_info = mse_loss(code_hat.squeeze(), noise[:, :n_latent_codes])
 
@@ -542,19 +551,29 @@ def train():
                 D.load(backup)
                 del backup
 
+            writer.add_scalar('Training/g_loss_fooling', g_loss_fooling, global_step)
+            writer.add_scalar('Training/g_loss_info', g_loss_info, global_step)
+            writer.add_scalar('Training/g_loss_l2', g_loss_l2, global_step)
+
             # calculate error
             with torch.no_grad():  # TODO: use the function above
                 err_all = torch.pow((pred_hat_4d[:, :, :2] - pred) / ss, 2)
                 err_all = err_all.sum(dim=2).sqrt()
                 e = err_all.sum().item() / n_next
+                f = err_all[:, -1].sum().item()
                 train_ADE += e
-                train_FDE += err_all[:, -1].sum().item()
+                train_FDE += f
 
-            batch_size_accum = 0;
+            batch_size_accum = 0
             sub_batches = []
+
+            writer.add_scalar('Training/ADE Iterwise', e, global_step)
+            writer.add_scalar('Training/FDE Iterwise', f, global_step)
 
     train_ADE /= n_train_samples
     train_FDE /= n_train_samples
+    writer.add_scalar('Training/ADE', train_ADE, global_step)
+    writer.add_scalar('Training/FDE', train_FDE, global_step)
     toc = time.clock()
     print(" Epc=%4d, Train ADE,FDE = (%.3f, %.3f) | time = %.1f" \
           % (epoch, train_ADE, train_FDE, toc - tic))
@@ -562,10 +581,11 @@ def train():
 
 def test(n_gen_samples=20, linear=False, write_to_file=None, just_one=False):
     # =========== Test error ============
+    global global_step, writer
     plt.close()
     ade_avg_12, fde_avg_12 = 0, 0
     ade_min_12, fde_min_12 = 0, 0
-    for ii, batch_i in enumerate(test_batches):        
+    for ii, batch_i in enumerate(test_batches):
         obsv = dataset_obsv[batch_i[0]:batch_i[1]]
         pred = dataset_pred[batch_i[0]:batch_i[1]]
         current_t = dataset_t[batch_i[0]]
@@ -612,29 +632,15 @@ def test(n_gen_samples=20, linear=False, write_to_file=None, just_one=False):
     fde_avg_12 /= n_test_samples
     ade_min_12 /= n_test_samples
     fde_min_12 /= n_test_samples
+
+    writer.add_scalar('Testing/ade_avg_12', ade_avg_12, global_step)
+    writer.add_scalar('Testing/fde_avg_12', fde_avg_12, global_step)
+    writer.add_scalar('Testing/ade_min_12', ade_min_12, global_step)
+    writer.add_scalar('Testing/fde_min_12', fde_min_12, global_step)
+
     print('Avg ADE,FDE (12)= (%.3f, %.3f) | Min(20) ADE,FDE (12)= (%.3f, %.3f)' \
           % (ade_avg_12, fde_avg_12, ade_min_12, fde_min_12))
 
-
-# =======================================================
-# ===================== M A I N =========================
-# =======================================================
-if os.path.isfile(model_file):
-    print('Loading model from ' + model_file)
-    checkpoint = torch.load(model_file)
-    start_epoch = checkpoint['epoch'] + 1
-
-    attention.load_state_dict(checkpoint['attentioner_dict'])
-    feature_embedder.load_state_dict(checkpoint['feature_embedder_dict'])
-    encoder.load_state_dict(checkpoint['encoder_dict'])
-    decoder.load_state_dict(checkpoint['decoder_dict'])
-    predictor_optimizer.load_state_dict(checkpoint['pred_optimizer'])
-
-    D.load_state_dict(checkpoint['D_dict'])
-    D_optimizer.load_state_dict(checkpoint['D_optimizer'])
-else:
-    min_train_ADE = 10000
-    start_epoch = 1
 
 # FIXME: comment here to train
 # wr_dir = '../preds-iccv/' + dataset_name + '/' + model_name + '/' + str(0000)
@@ -642,27 +648,71 @@ else:
 # test(n_gen_samples=128, write_to_file=wr_dir)
 # exit(1)
 
-# ===================== TRAIN =========================
-for epoch in trange(start_epoch, n_epochs + 1):  # FIXME : set the number of epochs
-    # Main training function
-    train()
+# ===================== MAIN =========================
+if __name__ == '__main__':
+    # LSTM-based path encoder
+    encoder = EncoderLstm(hidden_size, n_lstm_layers).cuda()
+    feature_embedder = EmbedSocialFeatures(num_social_features, social_feature_size).cuda()
+    attention = AttentionPooling(hidden_size, social_feature_size).cuda()
 
-    # ============== Save model on disk ===============
-    if epoch % 50 == 0:  # FIXME : set the interval for running tests
-        print('Saving model to file ...', model_file)
-        torch.save({
-            'epoch': epoch,
-            'attentioner_dict': attention.state_dict(),
-            'feature_embedder_dict': feature_embedder.state_dict(),
-            'encoder_dict': encoder.state_dict(),
-            'decoder_dict': decoder.state_dict(),
-            'pred_optimizer': predictor_optimizer.state_dict(),
+    # Decoder
+    # decoder = DecoderFC(hidden_size + social_feature_size + noise_len).cuda()
+    decoder = DecoderLstm(hidden_size + social_feature_size + noise_len, hidden_size).cuda()
+    # decoder = DecoderLstm(social_feature_size + VEL_VEC_LEN + noise_len, traj_code_len).cuda()
 
-            'D_dict': D.state_dict(),
-            'D_optimizer': D_optimizer.state_dict()
-        }, model_file)
+    # The Generator parameters and their optimizer
+    predictor_params = chain(attention.parameters(), feature_embedder.parameters(),
+                             encoder.parameters(), decoder.parameters())
+    predictor_optimizer = opt.Adam(predictor_params, lr=lr_g, betas=(0.9, 0.999))
 
-    if epoch % 5 == 0:
-        wr_dir = '../medium/' + dataset_name + '/' + model_name + '/' + str(epoch)
-        os.makedirs(wr_dir, exist_ok=True)
-        test(128, write_to_file=wr_dir, just_one=True)
+    # The Discriminator parameters and their optimizer
+    D = Discriminator(n_next, hidden_size, n_latent_codes).cuda()
+    D_optimizer = opt.Adam(D.parameters(), lr=lr_d, betas=(0.9, 0.999))
+    mse_loss = nn.MSELoss()
+    bce_loss = nn.BCELoss()
+
+    print('hidden dim = %d | lr(G) =  %.5f | lr(D) =  %.5f' % (hidden_size, lr_g, lr_d))
+
+    if os.path.isfile(model_file):
+        print('Loading model from ' + model_file)
+        checkpoint = torch.load(model_file)
+        start_epoch = checkpoint['epoch'] + 1
+
+        attention.load_state_dict(checkpoint['attentioner_dict'])
+        feature_embedder.load_state_dict(checkpoint['feature_embedder_dict'])
+        encoder.load_state_dict(checkpoint['encoder_dict'])
+        decoder.load_state_dict(checkpoint['decoder_dict'])
+        predictor_optimizer.load_state_dict(checkpoint['pred_optimizer'])
+
+        D.load_state_dict(checkpoint['D_dict'])
+        D_optimizer.load_state_dict(checkpoint['D_optimizer'])
+    else:
+        min_train_ADE = 10000
+        start_epoch = 1
+
+    if args.ifTrain:
+        for epoch in trange(start_epoch, n_epochs + 1):  # FIXME : set the number of epochs
+            # Main training function
+            train()
+
+            # ============== Save model on disk ===============
+            if epoch % 50 == 0:  # FIXME : set the interval for running tests
+                print('Saving model to file ...', model_file)
+                torch.save({
+                    'epoch': epoch,
+                    'attentioner_dict': attention.state_dict(),
+                    'feature_embedder_dict': feature_embedder.state_dict(),
+                    'encoder_dict': encoder.state_dict(),
+                    'decoder_dict': decoder.state_dict(),
+                    'pred_optimizer': predictor_optimizer.state_dict(),
+
+                    'D_dict': D.state_dict(),
+                    'D_optimizer': D_optimizer.state_dict()
+                }, model_file)
+
+            if epoch % 100 == 0:
+                wr_dir = 'medium/' + dataset_name + '/' + model_name + '/' + str(epoch)
+                os.makedirs(wr_dir, exist_ok=True)
+                test(128, write_to_file=wr_dir, just_one=False)
+    else:
+        test(20, write_to_file=None, just_one=False)
