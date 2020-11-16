@@ -3,10 +3,13 @@ import time
 import argparse
 import matplotlib.pyplot as plt
 import copy
+
+import petname
 import torch
 import numpy as np
 import torch.nn as nn
 import torch.optim as opt
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 from itertools import chain
 from torch.autograd import Variable
@@ -21,11 +24,10 @@ parser.add_argument('--batch-size', '--b',
                     type=int, default=256, metavar='N',
                     help='input batch size for training (default: 256)')
 parser.add_argument('--epochs', '--e',
-                    type=int, default=1000, metavar='N',
+                    type=int, default=20000, metavar='N',
                     help='number of epochs to train (default: 1000)')
 parser.add_argument('--model', '--m',
-                    default='socialWays',
-                    choices=['socialWays'],
+                    default=None,
                     help='pick a specific network to train'
                          '(default: "socialWays")')
 parser.add_argument('--latent-dim', '--ld',
@@ -49,12 +51,16 @@ parser.add_argument('--dataset', '--data',
                     help='pick a specific dataset (default: "hotel")')
 args = parser.parse_args()
 
+writer = SummaryWriter()
+global_step = 0
 
 # ========== set input/output files ============
 dataset_name = args.dataset
 model_name = args.model
-input_file = '../hotel-8-12.npz'
-model_file = '../trained_models/' + model_name + '-' + dataset_name + '.pt'
+if model_name is None:
+    model_name = petname.generate()
+input_file = 'hotel-8-12.npz'
+model_file = 'trained_models/' + model_name + '-' + dataset_name + '.pt'
 
 # FIXME: ====== training hyper-parameters ======
 # Unrolled GAN
@@ -80,7 +86,7 @@ num_social_features = 3
 social_feature_size = args.hidden_size
 noise_len = args.hidden_size // 2
 n_lstm_layers = 1
-use_social = False
+use_social = False  # False
 # ==============================================
 
 # FIXME: ======= Loda Data =====================
@@ -437,6 +443,7 @@ def predict(obsv_p, noise, n_next, sub_batches=[]):
 
 # =============== Training Loop ==================
 def train():
+    global writer, global_step
     tic = time.clock()
     # Evaluation metrics (ADE/FDE)
     train_ADE, train_FDE = 0, 0
@@ -474,6 +481,9 @@ def train():
 
             # ============== Train Discriminator ================
             for u in range(n_unrolling_steps + 1):
+                ### Tighest loop
+                global_step += 1
+
                 # Zero the gradient buffers of all parameters
                 D.zero_grad()
                 with torch.no_grad():
@@ -497,6 +507,10 @@ def train():
 
                 if u == 0 and n_unrolling_steps > 0:
                     backup = copy.deepcopy(D)
+
+                writer.add_scalar(f'Training/d_loss_fake', d_loss_fake, global_step)
+                writer.add_scalar(f'Training/d_loss_info', d_loss_info, global_step)
+                writer.add_scalar(f'Training/d_loss_real', d_loss_real, global_step)
 
             # =============== Train Generator ================= #
             # Zero the gradient buffers of all the discriminator parameters
@@ -547,21 +561,33 @@ def train():
                 err_all = torch.pow((pred_hat_4d[:, :, :2] - pred) / ss, 2)
                 err_all = err_all.sum(dim=2).sqrt()
                 e = err_all.sum().item() / n_next
+                f = err_all[:, -1].sum().item()
                 train_ADE += e
-                train_FDE += err_all[:, -1].sum().item()
+                train_FDE += f
 
             batch_size_accum = 0;
             sub_batches = []
 
+            writer.add_scalar(f'Training/g_loss_l2', g_loss_l2, global_step)
+            writer.add_scalar(f'Training/g_loss_fooling', g_loss_fooling, global_step)
+            writer.add_scalar(f'Training/g_loss_info', g_loss_info, global_step)
+
+            writer.add_scalar(f'Training Iterwise/ADE', e, global_step)
+            writer.add_scalar(f'Training Iterwise/FDE', f, global_step)
+
     train_ADE /= n_train_samples
     train_FDE /= n_train_samples
     toc = time.clock()
+    writer.add_scalar(f'Training /ADE', train_ADE, global_step)
+    writer.add_scalar(f'Training /FDE', train_FDE, global_step)
+
     print(" Epc=%4d, Train ADE,FDE = (%.3f, %.3f) | time = %.1f" \
           % (epoch, train_ADE, train_FDE, toc - tic))
 
 
 def test(n_gen_samples=20, linear=False, write_to_file=None, just_one=False):
     # =========== Test error ============
+    global writer, global_step
     plt.close()
     ade_avg_12, fde_avg_12 = 0, 0
     ade_min_12, fde_min_12 = 0, 0
@@ -612,6 +638,12 @@ def test(n_gen_samples=20, linear=False, write_to_file=None, just_one=False):
     fde_avg_12 /= n_test_samples
     ade_min_12 /= n_test_samples
     fde_min_12 /= n_test_samples
+
+    writer.add_scalar(f'Testing/ade_avg_12', ade_avg_12, global_step)
+    writer.add_scalar(f'Testing/fde_avg_12', fde_avg_12, global_step)
+    writer.add_scalar(f'Testing/ade_min_12', ade_min_12, global_step)
+    writer.add_scalar(f'Testing/fde_min_12', fde_min_12, global_step)
+
     print('Avg ADE,FDE (12)= (%.3f, %.3f) | Min(20) ADE,FDE (12)= (%.3f, %.3f)' \
           % (ade_avg_12, fde_avg_12, ade_min_12, fde_min_12))
 
@@ -662,7 +694,7 @@ for epoch in trange(start_epoch, n_epochs + 1):  # FIXME : set the number of epo
             'D_optimizer': D_optimizer.state_dict()
         }, model_file)
 
-    if epoch % 5 == 0:
-        wr_dir = '../medium/' + dataset_name + '/' + model_name + '/' + str(epoch)
+    if epoch % 100 == 0:
+        wr_dir = 'medium/' + dataset_name + '/' + model_name + '/' + str(epoch)
         os.makedirs(wr_dir, exist_ok=True)
-        test(128, write_to_file=wr_dir, just_one=True)
+        test(128, write_to_file=wr_dir, just_one=False)

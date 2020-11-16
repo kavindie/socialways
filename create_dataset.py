@@ -1,8 +1,8 @@
 import numpy as np
 from utils.parse_utils import BIWIParser, create_dataset
 
-annot_file = 'path-to-dataset/obsmat.txt'   # FixMe: fix the input address
-npz_out_file = '../data-8-12.npz'           # FixMe: fix the output filename
+annot_file = '../social_lstm_keras_tf/data/datasets/eth/hotel/obsmat.txt'  #'path-to-dataset/obsmat.txt'   # FixMe: fix the input address
+npz_out_file = '../hotel-8-12.npz'           # FixMe: fix the output filename
 parser = BIWIParser()
 parser.load(annot_file)
 
